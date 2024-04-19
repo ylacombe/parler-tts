@@ -904,7 +904,7 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
                 
         alibi = None
         if self.use_alibi:
-            alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
+            alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=inputs_embeds.dtype)
 
 
         input_shape = inputs_embeds.size()[:-1]
@@ -925,6 +925,8 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
             # maybe should modify position embeddings
             positions = self.embed_positions(inputs_embeds, past_key_values_length)
             hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        else:
+            hidden_states = inputs_embeds
 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
