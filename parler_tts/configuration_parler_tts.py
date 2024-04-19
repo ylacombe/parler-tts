@@ -59,7 +59,7 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
         activation_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for activations inside the fully connected layer.
         max_position_embeddings (`int`, *optional*, defaults to 2048):
-            The maximum sequence length that this model might ever be used with. Typically, set this to something large
+            The maximum sequence length that this model might ever be used with, when `alibi` is `False`. Typically, set this to something large
             just in case (e.g., 512 or 1024 or 2048).
         initializer_factor (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -74,6 +74,10 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
             The number of parallel codebooks forwarded to the model.
         tie_word_embeddings(`bool`, *optional*, defaults to `False`):
             Whether input and output word embeddings should be tied.
+        fix_vocab_size_offset(`bool`, *optional*, defaults to `False`):
+            Whether to remove the offset of one in the embedding layers. Defaults to `False` for backward compatibility.
+        alibi (`bool`, *optional*, defaults to `False`):
+            Whether to use ALiBi positional biases during self-attention.
     """
 
     model_type = "parler_tts_decoder"
@@ -100,6 +104,8 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
         bos_token_id=2049,
         eos_token_id=2048,
         tie_word_embeddings=False,
+        fix_vocab_size_offset=False,
+        alibi=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -117,6 +123,8 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
         self.num_codebooks = num_codebooks
+        self.fix_vocab_size_offset = fix_vocab_size_offset
+        self.alibi = alibi
 
         super().__init__(
             pad_token_id=pad_token_id,

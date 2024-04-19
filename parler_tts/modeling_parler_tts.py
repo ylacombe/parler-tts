@@ -59,10 +59,33 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "ParlerTTSConfig"
 _CHECKPOINT_FOR_DOC = "facebook/parler_tts-small"
 
-MUSICGEN_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "facebook/parler_tts-small",
-    # See all ParlerTTS models at https://huggingface.co/models?filter=parler_tts
-]
+
+def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
+    batch_size, seq_length = attention_mask.shape
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, device=attention_mask.device, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+        )
+        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+        extra_powers = torch.arange(1, 1 + 2 * num_remaining_heads, 2, device=attention_mask.device, dtype=torch.int32)
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+
+    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+    # => the query_length dimension will then be broadcasted correctly
+    # This is more or less identical to T5's relative position bias:
+    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
+    alibi = slopes[..., None] * arange_tensor
+    return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
 
 
 def apply_delay_pattern_mask(input_ids, decoder_pad_token_mask):
@@ -269,6 +292,7 @@ class ParlerTTSAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        alibi: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -324,6 +348,8 @@ class ParlerTTSAttention(nn.Module):
 
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        if alibi is not None:
+            attn_weights = attn_weights + alibi
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -418,6 +444,7 @@ class ParlerTTSDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        alibi: Optional[torch.Tensor] = None, # TODO: add in docs
         layer_head_mask: Optional[torch.Tensor] = None,
         cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -455,6 +482,7 @@ class ParlerTTSDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            alibi=alibi, # alibi only used in the self-attention layer: https://github.com/ofirpress/attention_with_linear_biases/issues/5
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -765,17 +793,25 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
         self.d_model = config.hidden_size
         self.num_codebooks = config.num_codebooks
         self.embed_scale = math.sqrt(config.hidden_size) if config.scale_embedding else 1.0
+        self.use_alibi = config.alibi
+        self.num_heads = config.num_attention_heads
 
-        # TODO(YL): actually doesn't need the +1 if initialized correctly. Too late to change now.
-        embed_dim = config.vocab_size + 1  # + 1 for pad token id
+        if not config.fix_vocab_size_offset:
+            embed_dim = config.vocab_size + 1  # + 1 for pad token id - Kept for backwards compatibility
+        else:
+            embed_dim = config.vocab_size
+
         self.embed_tokens = nn.ModuleList(
             [nn.Embedding(embed_dim, config.hidden_size) for _ in range(config.num_codebooks)]
         )
 
-        self.embed_positions = ParlerTTSSinusoidalPositionalEmbedding(
-            config.max_position_embeddings,
-            config.hidden_size,
-        )
+        if self.use_alibi:
+            self.embed_positions = None
+        else:
+            self.embed_positions = ParlerTTSSinusoidalPositionalEmbedding(
+                config.max_position_embeddings,
+                config.hidden_size,
+            )
 
         self.layers = nn.ModuleList([ParlerTTSDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.layer_norm = nn.LayerNorm(config.hidden_size)
@@ -865,6 +901,11 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
                     ],
                     dim=1,
                 )
+                
+        alibi = None
+        if self.use_alibi:
+            alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
+
 
         input_shape = inputs_embeds.size()[:-1]
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -878,12 +919,12 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
                 encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
             )
 
-        # embed positions
-        # TODO: As it is, the masked ids from the prompt will still count in the positions embeddings
-        # maybe should modify position embeddings
-        positions = self.embed_positions(inputs_embeds, past_key_values_length)
-
-        hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        if not self.use_alibi:
+            # embed positions
+            # TODO: As it is, the masked ids from the prompt will still count in the positions embeddings
+            # maybe should modify position embeddings
+            positions = self.embed_positions(inputs_embeds, past_key_values_length)
+            hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
@@ -925,6 +966,7 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    alibi,
                     head_mask[idx] if head_mask is not None else None,
                     cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
                     None,
@@ -937,6 +979,7 @@ class ParlerTTSDecoder(ParlerTTSPreTrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
+                    alibi=alibi,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     cross_attn_layer_head_mask=(
                         cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
