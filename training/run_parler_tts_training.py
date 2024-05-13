@@ -1611,13 +1611,12 @@ def main():
             resume_step = None
 
         for batch in train_dataloader:
-            with accelerator.accumulate(model):
-                loss, train_metric = train_step(batch, accelerator, autocast_kwargs)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            loss, train_metric = train_step(batch, accelerator, autocast_kwargs)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
             # Check if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
