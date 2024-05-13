@@ -1510,10 +1510,11 @@ def main():
                     )
                 batch["encoder_outputs"] = encoder_outputs
 
+        # we return the hidden states in place of logits when `avoid_lm_head_computation=True`
         hidden_states = model(**batch, avoid_lm_head_computation=True).logits
-        labels = batch["labels"]
         detached_hidden_states = hidden_states.detach()
         detached_hidden_states.requires_grad = True
+        labels = batch["labels"]
         
         tmp_model = model.module if training_args.parallel_mode.value == "distributed" else model
         num_codebooks = tmp_model.config.decoder.num_codebooks
@@ -1534,7 +1535,7 @@ def main():
         # per codebook cross-entropy
         for codebook in range(num_codebooks):
             # since encoder hidden states have concatenated to hidden states, take the last hidden states corresponding to labels
-            logits = tmp_model.decoder.lm_heads[codebook](detached_hidden_states)[:, -labels.shape[1] :]
+            logits = tmp_model.decoder.lm_heads[codebook](detached_hidden_states[:, -labels.shape[1] :])
             codebook_logits = logits.contiguous().view(-1, logits.shape[-1])
             codebook_mask = mask[..., codebook].contiguous().view(-1)
             codebook_labels = labels[..., codebook].contiguous().view(-1)
