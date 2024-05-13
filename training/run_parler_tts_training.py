@@ -1510,15 +1510,13 @@ def main():
                     )
                 batch["encoder_outputs"] = encoder_outputs
 
-        outputs = model(**batch, avoid_lm_head_computation=True)
+        hidden_states = model(**batch, avoid_lm_head_computation=True).logits
         labels = batch["labels"]
-        hidden_states = outputs.logits
         detached_hidden_states = hidden_states.detach()
         detached_hidden_states.requires_grad = True
         
         tmp_model = model.module if training_args.parallel_mode.value == "distributed" else model
         num_codebooks = tmp_model.config.decoder.num_codebooks
-        loss = torch.zeros([], device=tmp_model.device)
 
         loss_fct = CrossEntropyLoss()
         loss = torch.zeros([], device=tmp_model.device)
@@ -1543,14 +1541,11 @@ def main():
 
             codebook_loss = loss_fct(codebook_logits[codebook_mask], codebook_labels[codebook_mask]) / num_codebooks
             accelerator.backward(codebook_loss)
-            loss += codebook_loss
-        
-        # CE (data) loss
-        ce_loss = loss
+            loss += codebook_loss.detach()
 
-        metrics = {"loss": ce_loss}
+        metrics = {"loss": loss}
         accelerator.backward(hidden_states, gradient=detached_hidden_states.grad)
-        return ce_loss, metrics
+        return loss, metrics
 
     # Define eval fn
     def eval_step(
