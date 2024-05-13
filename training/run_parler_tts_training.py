@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Union, Set
 import datasets
 import numpy as np
 import torch
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 
 from datasets import DatasetDict, load_dataset, Dataset, IterableDataset, interleave_datasets, concatenate_datasets
@@ -65,6 +66,7 @@ from parler_tts import (
     ParlerTTSConfig,
     build_delay_pattern_mask,
 )
+from parler_tts.modeling_parler_tts import shift_tokens_right
 
 from wandb import Audio
 
@@ -1508,11 +1510,46 @@ def main():
                     )
                 batch["encoder_outputs"] = encoder_outputs
 
-        outputs = model(**batch)
+        outputs = model(**batch, avoid_lm_head_computation=True)
+        labels = batch["labels"]
+        hidden_states = outputs.logits
+        detached_hidden_states = hidden_states.detach()
+        detached_hidden_states.requires_grad = True
+        
+        tmp_model = model.module if training_args.parallel_mode.value == "distributed" else model
+        num_codebooks = tmp_model.config.decoder.num_codebooks
+        loss = torch.zeros([], device=tmp_model.device)
+
+        loss_fct = CrossEntropyLoss()
+        loss = torch.zeros([], device=tmp_model.device)
+
+
+        # (bsz, vocab_size, seq_len, num_codebooks), (bsz, seq_len, num_codebooks)
+        labels = labels.masked_fill(labels == tmp_model.config.decoder.bos_token_id, -100)
+
+        # we use every codebooks token AND one single EOS at the end of each codebooks
+        input_ids = shift_tokens_right(
+                labels, tmp_model.config.pad_token_id, tmp_model.config.decoder_start_token_id
+            ).transpose(1, 2)
+        mask = (input_ids.transpose(1, 2) != tmp_model.config.decoder.eos_token_id) & ((labels != -100))
+ 
+        # per codebook cross-entropy
+        for codebook in range(num_codebooks):
+            # since encoder hidden states have concatenated to hidden states, take the last hidden states corresponding to labels
+            logits = tmp_model.decoder.lm_heads[codebook](detached_hidden_states)[:, -labels.shape[1] :]
+            codebook_logits = logits.contiguous().view(-1, logits.shape[-1])
+            codebook_mask = mask[..., codebook].contiguous().view(-1)
+            codebook_labels = labels[..., codebook].contiguous().view(-1)
+
+            codebook_loss = loss_fct(codebook_logits[codebook_mask], codebook_labels[codebook_mask]) / num_codebooks
+            accelerator.backward(codebook_loss)
+            loss += codebook_loss
+        
         # CE (data) loss
-        ce_loss = outputs.loss
+        ce_loss = loss
 
         metrics = {"loss": ce_loss}
+        accelerator.backward(hidden_states, gradient=detached_hidden_states.grad)
         return ce_loss, metrics
 
     # Define eval fn
@@ -1580,7 +1617,6 @@ def main():
         for batch in train_dataloader:
             with accelerator.accumulate(model):
                 loss, train_metric = train_step(batch, accelerator, autocast_kwargs)
-                accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
                 optimizer.step()

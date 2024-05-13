@@ -1110,6 +1110,7 @@ class ParlerTTSForCausalLM(ParlerTTSPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        avoid_lm_head_computation: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length, num_codebooks)`, *optional*):
@@ -1139,6 +1140,19 @@ class ParlerTTSForCausalLM(ParlerTTSPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        if avoid_lm_head_computation:
+            if not return_dict:
+                output = (hidden_states,) + outputs[1:]
+                return output
+
+            return CausalLMOutputWithCrossAttentions(
+                loss=None,
+                logits=hidden_states,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                cross_attentions=outputs.cross_attentions,
+            )
 
         lm_logits = torch.stack([head(hidden_states) for head in self.lm_heads], dim=1)
 
@@ -1936,6 +1950,7 @@ class ParlerTTSForConditionalGeneration(PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        avoid_lm_head_computation: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, Seq2SeqLMOutput]:
         r"""
@@ -2052,6 +2067,7 @@ class ParlerTTSForConditionalGeneration(PreTrainedModel):
             past_key_values=past_key_values,
             return_dict=return_dict,
             labels=labels,
+            avoid_lm_head_computation=avoid_lm_head_computation,
             **kwargs_decoder,
         )
 
