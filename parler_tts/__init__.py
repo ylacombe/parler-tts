@@ -23,3 +23,6 @@ else:
     AutoConfig.register("dac_on_the_hub", DACConfig)
 
 AutoModel.register(DACConfig, DACModel)
+
+from .configuration_simple_parler_tts import PrefixLMParlerTTSConfig, PrefixLMParlerTTSDecoderConfig
+from .modeling_simple_parler_tts import PrefixLMParlerTTSForCausalLM, PrefixLMParlerTTSForConditionalGeneration
