@@ -260,6 +260,7 @@ class PrefixLMParlerTTSConfig(PretrainedConfig):
         self.audio_encoder_config = AutoConfig.for_model(audio_encoder_model_type, **audio_encoder_config)
         self.decoder_config = PrefixLMParlerTTSDecoderConfig(**decoder_config)
         self.decoder_config._attn_implementation = self._attn_implementation
+        self._attn_implementation_autoset = True
         self.is_encoder_decoder = True
 
     @classmethod

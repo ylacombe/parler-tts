@@ -76,7 +76,8 @@ if is_flash_attn_2_available():
 
 if is_torch_greater_or_equal("2.5"):
     from torch.nn.attention.flex_attention import flex_attention, and_masks, create_block_mask
-    flex_attention = torch.compile(flex_attention)#, dynamic=False)
+    flex_attention = torch.compile(flex_attention) #, dynamic=False)
+    # create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 
 
@@ -861,8 +862,7 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position=None,
-        description_lengths=None,
-        prompt_lengths=None,
+        block_mask=None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -957,33 +957,6 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
                 attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
             )
             
-        block_mask = None
-        if self.config._attn_implementation == "flex_attention":
-            max_prompt_length = 0 if prompt_lengths is None else prompt_lengths.max()
-            max_description_length = 0 if description_lengths is None else description_lengths.max()
-
-            if prompt_lengths is None and description_lengths is not None:
-                def sparse_mask(b, h, q_idx, kv_idx):
-                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
-                    return torch.logical_not(not_attend_description)
-            elif prompt_lengths is not None and description_lengths is None:
-                def sparse_mask(b, h, q_idx, kv_idx):
-                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
-                    return torch.logical_not(not_attend_prompt)
-            else:                 
-                def sparse_mask(b, h, q_idx, kv_idx):
-                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
-                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
-                    
-                    return torch.logical_not(torch.logical_or(not_attend_description, not_attend_prompt))
-
-            mask_mod = and_masks(sparse_mask, mod_causal_mask) if description_lengths is not None or prompt_lengths is not None else causal_mask
-            # block_mask = create_block_mask(mask_mod, B=position_ids.shape[0], H=None, Q_LEN=query.shape[1], KV_LEN=key.shape[1], device=position_ids.device, _compile=True)
-            KV_LEN = position_ids.shape[1]+past_key_values_length if causal_mask is None else causal_mask.shape[-1]
-            Q_LEN = position_ids.shape[1] if causal_mask is None else causal_mask.shape[-2]
-            block_mask = create_block_mask(mask_mod, B=position_ids.shape[0], H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=position_ids.device, _compile=False)
-
-                
         hidden_states = inputs_embeds
 
         # decoder layers
@@ -1005,7 +978,7 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
-                    block_mask
+                    block_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1222,8 +1195,7 @@ class PrefixLMParlerTTSModel(PrefixLMParlerTTSPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        description_lengths=None,
-        prompt_lengths=None,
+        block_mask=None,
         ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1246,8 +1218,7 @@ class PrefixLMParlerTTSModel(PrefixLMParlerTTSPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            description_lengths=description_lengths,
-            prompt_lengths=prompt_lengths,
+            block_mask=block_mask,
         )
 
         if not return_dict:
@@ -1317,8 +1288,7 @@ class PrefixLMParlerTTSForCausalLM(PrefixLMParlerTTSPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         loss_reduction: str = "mean",
-        description_lengths=None,
-        prompt_lengths=None,
+        block_mask=None,
         ) -> Union[Tuple, PrefixLMParlerTTSCausalLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length, num_codebooks)`, *optional*):
@@ -1343,8 +1313,7 @@ class PrefixLMParlerTTSForCausalLM(PrefixLMParlerTTSPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            description_lengths=description_lengths,
-            prompt_lengths=prompt_lengths,
+            block_mask=block_mask,
         )
 
         hidden_states = outputs[0]
@@ -1633,6 +1602,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         loss_reduction: str = "mean",
+        block_mask = None,
         **kwargs,
     ) -> Union[Tuple, PrefixLMParlerTTSSeq2SeqLMOutput]:
         r"""
@@ -1715,11 +1685,15 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
             encoder_hidden_states = prompt_hidden_states
             
         prompt_lengths, description_lengths = kwargs.get("prompt_lengths", None), kwargs.get("description_lengths", None)
+        max_prompt_length, max_description_length = kwargs.get("max_prompt_length", 0), kwargs.get("max_description_length", 0)
         if prompt_attention_mask is not None and attention_mask is not None:
             prompt_lengths, description_lengths = prompt_attention_mask.sum(dim=1), attention_mask.sum(dim=1)
+            max_prompt_length = prompt_attention_mask.shape[1]
+            max_description_length = attention_mask.shape[1]
             attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
         elif prompt_attention_mask is not None and attention_mask is None:
             prompt_lengths, description_lengths = prompt_attention_mask.sum(dim=1), None
+            max_prompt_length = prompt_attention_mask.shape[1]
             attention_mask = prompt_attention_mask
 
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
@@ -1745,6 +1719,26 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
             decoder_input_ids = audio_codes[0, ...].reshape(bsz * self.decoder.num_codebooks, seq_len)
 
 
+        if self.config._attn_implementation == "flex_attention" and block_mask is None:        
+            if prompt_lengths is None and description_lengths is not None:
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
+                    return torch.logical_not(not_attend_description)
+            elif prompt_lengths is not None and description_lengths is None:
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
+                    return torch.logical_not(not_attend_prompt)
+            else:                 
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
+                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
+                    
+                    return torch.logical_not(torch.logical_or(not_attend_description, not_attend_prompt))
+
+            mask_mod = and_masks(sparse_mask, mod_causal_mask) if description_lengths is not None or prompt_lengths is not None else mod_causal_mask
+            length = max_prompt_length + max_description_length + decoder_input_ids.shape[-1]
+            block_mask = create_block_mask(mask_mod, B=encoder_hidden_states.shape[0], H=None, Q_LEN=length, KV_LEN=length, device=decoder_input_ids.device, _compile=False)
+
         # Decode
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -1761,8 +1755,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
             labels=labels,
             cache_position=cache_position,
             loss_reduction=loss_reduction,
-            description_lengths=description_lengths,
-            prompt_lengths=prompt_lengths,
+            block_mask=block_mask,
         )
 
         if not return_dict:
@@ -1790,8 +1783,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         encoder_outputs=None,
         decoder_delay_pattern_mask=None,
         cache_position=None,
-        description_lengths=None,
-        prompt_lengths=None,
+        block_mask=None,
         **kwargs,
     ):
         if decoder_delay_pattern_mask is None:
@@ -1831,13 +1823,24 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
                 past_length, past_length + decoder_input_ids.shape[1], device=decoder_input_ids.device
             )
         elif use_cache:
-            cur_len = decoder_input_ids.shape[1]                
+            cur_len = decoder_input_ids.shape[1]
             if encoder_outputs is not None:
                 # meaning we are in 1st generation step and inputs_embeds will be prepended
                 cur_len += encoder_outputs.last_hidden_state.shape[1]
 
             cache_position = cache_position[-cur_len:]
 
+        adapted_block_mask = None
+        if block_mask is not None and len(cache_position) == 1:
+                block_index = cache_position // block_mask.BLOCK_SIZE[0]
+                adapted_block_mask = block_mask[:, :, block_index]
+                def get_mask_mod(mask_mod, offset: int):
+                    def _mask_mod(b, h, q, kv):
+                        return mask_mod(b, h, q + offset, kv)
+
+                    return _mask_mod
+                adapted_block_mask.mask_mod = get_mask_mod(block_mask.mask_mod, cache_position[0])
+        
         if decoder_attention_mask is None and attention_mask is not None:
             input = decoder_input_ids.reshape(-1, self.decoder.num_codebooks, decoder_input_ids.shape[-1])
             bsz, _, seq_len = input.shape
@@ -1874,8 +1877,11 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
             "decoder_attention_mask": decoder_attention_mask,
             "use_cache": use_cache,
             "cache_position": cache_position,
-            "description_lengths": description_lengths,
-            "prompt_lengths": prompt_lengths,
+            "block_mask": adapted_block_mask,
+            "prompt_lengths":kwargs.get("prompt_lengths"),
+            "description_lengths":kwargs.get("description_lengths"),
+            "max_prompt_length":kwargs.get("max_prompt_length"),
+            "max_description_length":kwargs.get("max_description_length"),
         }
 
     def _prepare_decoder_input_ids_for_generation(
@@ -1952,13 +1958,17 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         prompt_attention_mask = model_kwargs.get("prompt_attention_mask", None)
         attention_mask = model_kwargs.get("attention_mask", None)
 
+        prompt_lengths = None
         if prompt_attention_mask is not None:
             prompt_lengths  = prompt_attention_mask.sum(dim=1)
             model_kwargs["prompt_lengths"] = prompt_lengths
+            model_kwargs["max_prompt_length"] = prompt_attention_mask.shape[1]
             
+        description_lengths = None
         if attention_mask is not None:
             description_lengths = attention_mask.sum(dim=1)
             model_kwargs["description_lengths"] = description_lengths
+            model_kwargs["max_description_length"] = attention_mask.shape[1]
 
         if prompt_attention_mask is not None and attention_mask is not None:
             attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
@@ -2014,7 +2024,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         ):
             encoder_hidden_states = self.enc_to_dec_proj(encoder_hidden_states)
 
-        if model_kwargs["attention_mask"] is not None:
+        if model_kwargs.get("attention_mask", None) is not None:
             encoder_hidden_states = encoder_hidden_states * model_kwargs["attention_mask"][..., None]
 
         model_kwargs["encoder_outputs"] = BaseModelOutput(last_hidden_state=encoder_hidden_states)
@@ -2286,7 +2296,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
 
-        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        requires_attention_mask = False # "encoder_outputs" not in model_kwargs
         kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
 
         # 3. Define model inputs
@@ -2301,7 +2311,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
 
         if model_kwargs.get("attention_mask", None) is None and requires_attention_mask:
             model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
-                inputs_tensor, generation_config._pad_token_tensor, generation_config._eos_token_tensor
+                inputs_tensor, generation_config, model_kwargs
             )
 
         if "encoder_outputs" not in model_kwargs:
@@ -2391,6 +2401,31 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         )
         # stash the delay mask so that we don't have to recompute in each forward pass
         model_kwargs["decoder_delay_pattern_mask"] = decoder_delay_pattern_mask
+
+        if self.config._attn_implementation == "flex_attention":
+            prompt_lengths, description_lengths = model_kwargs.get("prompt_lengths"), model_kwargs.get("description_lengths")
+            max_prompt_length, max_description_length = model_kwargs.get("max_prompt_length"), model_kwargs.get("max_description_length")
+            sparse_mask = None
+            if prompt_lengths is None and description_lengths is not None:
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
+                    return torch.logical_not(not_attend_description)
+            elif prompt_lengths is not None and description_lengths is None:
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
+                    return torch.logical_not(not_attend_prompt)
+            else:                 
+                def sparse_mask(b, h, q_idx, kv_idx):
+                    not_attend_prompt = kv_idx < max_prompt_length - prompt_lengths[b]
+                    not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
+                    
+                    return torch.logical_not(torch.logical_or(not_attend_description, not_attend_prompt))
+
+            mask_mod = and_masks(sparse_mask, mod_causal_mask) if description_lengths is not None or prompt_lengths is not None else mod_causal_mask
+            
+            max_length = generation_config.max_length+max_prompt_length+max_description_length
+            block_mask = create_block_mask(mask_mod, B=batch_size, H=None, Q_LEN=max_length, KV_LEN=max_length, device=delayed_input_ids.device, _compile=False)
+            model_kwargs["block_mask"] = block_mask
 
         # input_ids are ready to be placed on the streamer (if used)
         if streamer is not None:
