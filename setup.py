@@ -37,7 +37,7 @@ _extras_training_deps = [
     "wandb",
     "accelerate",
     "evaluate",
-    "datasets[audio]>=2.14.5",
+    "datasets[audio]>=2.14.5, <3.0",
 ]
 
 here = os.path.abspath(os.path.dirname(__file__))

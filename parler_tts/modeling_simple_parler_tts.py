@@ -143,8 +143,14 @@ def flash_attention_forward(config, query, key, value, mask, target_dtype=torch.
 def mod_causal_mask(b, h, q_idx, kv_idx):
     return q_idx >= kv_idx
 
-def flex_attention_forward(config, query, key, value, mask, output_attentions=False, **_kwargs):
+def flex_attention_forward(config, query, key, value, mask, target_dtype=torch.float16, output_attentions=False, **_kwargs):
     block_mask = _kwargs.get("block_mask")
+
+    input_dtype = query.dtype
+    if input_dtype == torch.float32:
+        query = query.to(target_dtype)
+        key = key.to(target_dtype)
+        value = value.to(target_dtype)
 
     attn_output = flex_attention(
         query,
@@ -171,13 +177,6 @@ def sdpa_attention_forward(config, query, key, value, mask, **_kwargs):
     causal_mask = mask
     if mask is not None:
         causal_mask = causal_mask[:, :, :, : key.shape[-2]]
-
-    # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-    # Reference: https://github.com/pytorch/pytorch/issues/112577.
-    if query.device.type == "cuda" and causal_mask is not None:
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
 
     # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
     # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
@@ -558,9 +557,8 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+@torch.compile #jit.script
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim: int=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -568,8 +566,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
@@ -616,14 +612,6 @@ class PrefixLMParlerTTSDecoderAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        # rotary embeddings are not used in the depth decoder
-        self.rope_theta = config.rope_theta
-        self.rotary_emb = PrefixLMParlerTTSRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
-
     # Copied from transformers.models.gemma.modeling_gemma.GemmaAttention.forward
     def forward(
         self,
@@ -634,6 +622,8 @@ class PrefixLMParlerTTSDecoderAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -646,7 +636,6 @@ class PrefixLMParlerTTSDecoderAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)  # Ignore copy
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)  # Ignore copy
 
         if past_key_value is not None:
@@ -663,6 +652,7 @@ class PrefixLMParlerTTSDecoderAttention(nn.Module):
             attention_type = self.config._attn_implementation
             
         kwargs["enable_gqa"] = self.num_key_value_groups > 1
+        kwargs["target_dtype"] = value_states.dtype
 
         attn_output, attn_weights = SIMPLE_PARLER_ATTENTION_FUNCTION[attention_type](
             self, query_states, key_states, value_states, attention_mask, output_attentions=output_attentions, **kwargs
@@ -719,6 +709,8 @@ class PrefixLMParlerTTSDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -753,6 +745,8 @@ class PrefixLMParlerTTSDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            cos=cos,
+            sin=sin,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -959,6 +953,8 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
             
         hidden_states = inputs_embeds
 
+        cos, sin = self.rotary_emb(inputs_embeds, position_ids)  # Ignore copy
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -979,6 +975,8 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
                     use_cache,
                     cache_position,
                     block_mask,
+                    cos,
+                    sin,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -990,6 +988,8 @@ class PrefixLMParlerTTSDecoder(PrefixLMParlerTTSPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     block_mask=block_mask,
+                    cos=cos,
+                    sin=sin,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1719,7 +1719,8 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
             decoder_input_ids = audio_codes[0, ...].reshape(bsz * self.decoder.num_codebooks, seq_len)
 
 
-        if self.config._attn_implementation == "flex_attention" and block_mask is None:        
+        if self.config._attn_implementation == "flex_attention" and block_mask is None:      
+            # suppose that padding side is left for both tokenizers  
             if prompt_lengths is None and description_lengths is not None:
                 def sparse_mask(b, h, q_idx, kv_idx):
                     not_attend_description = torch.logical_and(kv_idx>=max_prompt_length,kv_idx < max_prompt_length+max_description_length-description_lengths[b])
@@ -1832,14 +1833,14 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
 
         adapted_block_mask = None
         if block_mask is not None and len(cache_position) == 1:
-                block_index = cache_position // block_mask.BLOCK_SIZE[0]
-                adapted_block_mask = block_mask[:, :, block_index]
-                def get_mask_mod(mask_mod, offset: int):
-                    def _mask_mod(b, h, q, kv):
-                        return mask_mod(b, h, q + offset, kv)
+            block_index = cache_position // block_mask.BLOCK_SIZE[0]
+            adapted_block_mask = block_mask[:, :, block_index]
+            def get_mask_mod(mask_mod, offset: int):
+                def _mask_mod(b, h, q, kv):
+                    return mask_mod(b, h, q + offset, kv)
 
-                    return _mask_mod
-                adapted_block_mask.mask_mod = get_mask_mod(block_mask.mask_mod, cache_position[0])
+                return _mask_mod
+            adapted_block_mask.mask_mod = get_mask_mod(block_mask.mask_mod, cache_position[0])
         
         if decoder_attention_mask is None and attention_mask is not None:
             input = decoder_input_ids.reshape(-1, self.decoder.num_codebooks, decoder_input_ids.shape[-1])
@@ -2403,6 +2404,7 @@ class PrefixLMParlerTTSForConditionalGeneration(PreTrainedModel, GenerationMixin
         model_kwargs["decoder_delay_pattern_mask"] = decoder_delay_pattern_mask
 
         if self.config._attn_implementation == "flex_attention":
+            # suppose that padding side is left for both tokenizers  
             prompt_lengths, description_lengths = model_kwargs.get("prompt_lengths"), model_kwargs.get("description_lengths")
             max_prompt_length, max_description_length = model_kwargs.get("max_prompt_length"), model_kwargs.get("max_description_length")
             sparse_mask = None

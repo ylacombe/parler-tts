@@ -94,6 +94,12 @@ class ModelArguments:
             "help": "Prompt tokenizer padding side. Defaults to `left`. If the prompt is pre-pended to the codebooks hidden states, it should be padded on the left."
         },
     )
+    description_padding_side: Optional[str] = field(
+        default="right",
+        metadata={
+            "help": "Description tokenizer padding side. Defaults to `right`. If the prompt is pre-pended to the codebooks hidden states, it should be padded on the left."
+        },
+    )
 
 
 @dataclass

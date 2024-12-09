@@ -211,6 +211,7 @@ def main():
         token=data_args.token,
         trust_remote_code=data_args.trust_remote_code,
         use_fast=model_args.use_fast_tokenizer,
+        padding_side=model_args.description_padding_side,
     )
 
     if model_args.use_fast_tokenizer:
@@ -969,10 +970,8 @@ def main():
 
     def generate_step(batch, accelerator):
         batch.pop("decoder_attention_mask", None)
-        eval_model = accelerator.unwrap_model(model, keep_fp32_wrapper=True)
-        if training_args.torch_compile:
-            # if the model is compiled, we use the original model bc compile is not compatible with .generate
-            eval_model = model._orig_mod
+        eval_model = model if not training_args.torch_compile else model._orig_mod
+        eval_model = accelerator.unwrap_model(eval_model, keep_fp32_wrapper=True)
 
         # since we've might have loaded the weights in fp32, we have to autocast to ensure FA2 weights are in half-precision.
         # with accelerator.autocast(autocast_handler=AutocastKwargs(enabled=(attn_implementation=="flash_attention_2"))):
