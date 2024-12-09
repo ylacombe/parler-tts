@@ -211,13 +211,98 @@ def apply_delay_pattern_mask(input_ids, decoder_pad_token_mask):
     return input_ids
 
 
+def give_delay(codebook, strategy):
+    if strategy == "group":
+        return math.floor((codebook-1) / 2 + 1)
+    elif strategy == "delay_first_8":
+        return min(codebook, 7)
+    elif strategy == "group_first_6":
+        return math.floor((codebook-1) / 2 + 1) if codebook < 7 else 3
+    else:
+        return codebook
+    
+def build_special_tokens_delay_pattern(strategy, num_codebooks, max_length):
+    if strategy == "group":
+        triangular_num_codebooks = math.floor(num_codebooks / 2) + 1
+    elif strategy == "delay_first_8":
+        triangular_num_codebooks = min(num_codebooks, 8)
+    elif strategy == "group_first_6":
+        triangular_num_codebooks = min(num_codebooks, 7)
+        triangular_num_codebooks = math.floor(triangular_num_codebooks / 2) + 1
+    else:
+        triangular_num_codebooks = num_codebooks
+    
+    # construct a pattern mask that indicates the positions of padding tokens for each codebook
+    # first fill the upper triangular part (the EOS padding)
+    eos_delay_pattern = torch.triu(
+        torch.ones((triangular_num_codebooks, max_length), dtype=torch.bool), diagonal=max_length - triangular_num_codebooks + 1
+    )
+    # then fill the lower triangular part (the BOS padding)
+    bos_delay_pattern = torch.tril(torch.ones((triangular_num_codebooks, max_length), dtype=torch.bool))
+    
+    if strategy == "group":
+        tmp_bos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+        tmp_eos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+
+        # the first codebook delay stays the same
+        tmp_eos_delay_pattern[0] = eos_delay_pattern[0]
+        tmp_bos_delay_pattern[0] = bos_delay_pattern[0]
+        
+        # duplicate the other codebooks delays
+        eos_delay_pattern = torch.repeat_interleave(eos_delay_pattern[1:], 2, dim=0)
+        bos_delay_pattern = torch.repeat_interleave(bos_delay_pattern[1:], 2, dim=0)
+        
+        # drop the last duplicated codebook if it's not even
+        tmp_eos_delay_pattern[1:] = eos_delay_pattern[:-1] if (num_codebooks - 1) % 2 else eos_delay_pattern
+        tmp_bos_delay_pattern[1:] = bos_delay_pattern[:-1] if (num_codebooks - 1) % 2 else bos_delay_pattern
+        bos_delay_pattern = tmp_bos_delay_pattern
+        eos_delay_pattern = tmp_eos_delay_pattern
+    elif strategy == "delay_first_8":
+        # add handmade block pattern for the last num_codebooks-8 codebooks
+        tmp_bos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+        tmp_eos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+        
+        tmp_bos_delay_pattern[:triangular_num_codebooks] =  bos_delay_pattern
+        tmp_eos_delay_pattern[:triangular_num_codebooks] =  eos_delay_pattern
+        
+        tmp_bos_delay_pattern[triangular_num_codebooks:, :8] = True
+        bos_delay_pattern = tmp_bos_delay_pattern
+
+        # eos stays the same
+        eos_delay_pattern = tmp_eos_delay_pattern
+    elif strategy == "group_first_6":
+        tmp_bos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+        tmp_eos_delay_pattern = torch.zeros((num_codebooks, max_length), dtype=torch.bool)
+
+        # the first codebook delay stays the same
+        tmp_eos_delay_pattern[0] = eos_delay_pattern[0]
+        tmp_bos_delay_pattern[0] = bos_delay_pattern[0]
+        
+        # duplicate the other codebooks delays
+        eos_delay_pattern = torch.repeat_interleave(eos_delay_pattern[1:], 2, dim=0)
+        bos_delay_pattern = torch.repeat_interleave(bos_delay_pattern[1:], 2, dim=0)
+        
+        # drop the last duplicated codebook if it's not even
+        tmp_eos_delay_pattern[1:7] = eos_delay_pattern
+        tmp_bos_delay_pattern[1:7] = bos_delay_pattern
+        
+        tmp_bos_delay_pattern[7:, :4] = True
+        bos_delay_pattern = tmp_bos_delay_pattern
+        eos_delay_pattern = tmp_eos_delay_pattern
+
+    return bos_delay_pattern, eos_delay_pattern
+
 def build_delay_pattern_mask(
-    input_ids: torch.LongTensor, bos_token_id: int, pad_token_id: int, max_length: int, num_codebooks: int
+    input_ids: torch.LongTensor, bos_token_id: int, pad_token_id: int, max_length: int, num_codebooks: int, strategy: str = None
 ):
-    """Build a delayed pattern mask to the input_ids. Each codebook is offset by the previous codebook by
-    one, giving a delayed pattern mask at the start of sequence and end of sequence. Take the example where there
-    are 4 codebooks and a max sequence length of 8, we have the delayed pattern mask of shape `(codebooks,
-    seq_len)`:
+    """Build a delayed pattern mask to the input_ids. 
+    
+    
+    If `strategy` is not specified or `delay`:
+    
+    Each codebook is offset by the previous codebook by one, giving a delayed pattern mask at the start of sequence and 
+    end of sequence. Take the example where there are 4 codebooks and a max sequence length of 8, we have the delayed 
+    pattern mask of shape `(codebooks, seq_len)`:
     - [B, -1, -1, -1, -1, P, P, P]
     - [B, B, -1, -1, -1, -1, P, P]
     - [B, B, B, -1, -1, -1, -1, P]
@@ -231,6 +316,21 @@ def build_delay_pattern_mask(
     - [B, B, B, B, g, h, -1, -1]
     where a-h indicate the input prompt (decoder input ids) that are offset by 1. Now, we only override the -1
     tokens in our prediction.
+    
+    If `strategy` is `group`:
+    Except the first codebook, delays are applied to group of codebooks. To illustrate with 6 codebooks:
+    - [B, a, b, -1, -1,  P,  P,  P]
+    - [B, B, c,  d, -1, -1,  P,  P]
+    - [B, B, e,  f, -1, -1,  P,  P]
+    - [B, B, B,  g,  h, -1, -1,  P]
+    - [B, B, B,  i,  j, -1, -1,  P]
+    - [B, B, B,  B,  k,  l, -1, -1]
+
+    If `strategy` is `delay_first_8`:
+    1-delays are apply for the 8 first codebooks. The rest of the codebooks applies a delay of 8. 
+    
+    if `strategy` is `group_first_6`:
+    Groups are applied from the second codebook to the 7th included. The first codebook doesn't have delay. The rest of the codebooks applies the same as the 7th codebook.
     """
     # (bsz * num_codebooks, seq_len) -> (bsz, num_codebooks, seq_len)
     input_ids = input_ids.reshape(-1, num_codebooks, input_ids.shape[-1])
@@ -245,15 +345,11 @@ def build_delay_pattern_mask(
     # fill the shifted ids with the prompt entries, offset by the codebook idx
     for codebook in range(num_codebooks):
         # mono channel - loop over the codebooks one-by-one
-        input_ids_shifted[:, codebook, codebook : seq_len + codebook] = input_ids[:, codebook]
+        codebook_delay = give_delay(codebook, strategy)
+        input_ids_shifted[:, codebook, codebook_delay : seq_len + codebook_delay] = input_ids[:, codebook]
 
     # construct a pattern mask that indicates the positions of padding tokens for each codebook
-    # first fill the upper triangular part (the EOS padding)
-    eos_delay_pattern = torch.triu(
-        torch.ones((num_codebooks, max_length), dtype=torch.bool), diagonal=max_length - num_codebooks + 1
-    )
-    # then fill the lower triangular part (the BOS padding)
-    bos_delay_pattern = torch.tril(torch.ones((num_codebooks, max_length), dtype=torch.bool))
+    bos_delay_pattern, eos_delay_pattern = build_special_tokens_delay_pattern(strategy, num_codebooks, max_length)
 
     bos_mask = ~(bos_delay_pattern).to(input_ids.device)
     eos_mask = ~(eos_delay_pattern).to(input_ids.device)
@@ -2038,7 +2134,7 @@ class ParlerTTSForCausalLM(ParlerTTSPreTrainedModel):
 
     # Ignore copy
     def build_delay_pattern_mask(
-        self, input_ids: torch.LongTensor, bos_token_id: int, pad_token_id: int, max_length: int = None
+        self, input_ids: torch.LongTensor, bos_token_id: int, pad_token_id: int, max_length: int = None, strategy: str = None
     ):
         """Build a delayed pattern mask to the input_ids. Each codebook is offset by the previous codebook by
         one, giving a delayed pattern mask at the start of sequence and end of sequence. Take the example where there
@@ -2059,7 +2155,8 @@ class ParlerTTSForCausalLM(ParlerTTSPreTrainedModel):
         tokens in our prediction.
         """
         max_length = max_length if max_length is not None else self.generation_config.max_length
-        return build_delay_pattern_mask(input_ids, bos_token_id, pad_token_id, max_length, self.num_codebooks)
+        strategy = strategy if strategy is not None else self.config.delay_strategy
+        return build_delay_pattern_mask(input_ids, bos_token_id, pad_token_id, max_length, self.num_codebooks, strategy=strategy)
 
     @staticmethod
     def apply_delay_pattern_mask(input_ids, decoder_pad_token_mask):

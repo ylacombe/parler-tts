@@ -99,6 +99,8 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
             Whether to fuse audio LM heads instead of applying them sequentially.
         codebook_weights(`List[int]`, *optional*):
             Weights applied to each codebook when computing the loss.
+        delay_strategy (`str`, *optional*, defaults to `"delay"`):
+            Specify which delay pattern strategy to apply. One of `"delay"`, `"group"`, `"group_first_6"` or `"delay_first_8"`.
     """
 
     model_type = "parler_tts_decoder"
@@ -132,6 +134,7 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
         cross_attention_implementation_strategy=None,
         use_fused_lm_heads=False,
         codebook_weights=None,
+        delay_strategy="delay",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -163,6 +166,19 @@ class ParlerTTSDecoderConfig(PretrainedConfig):
 
         if codebook_weights is not None and len(codebook_weights) != num_codebooks:
             raise ValueError(f"`codebook_weights` has length {len(codebook_weights)} when it should be of length {num_codebooks}.")
+        
+        if delay_strategy == "group_first_6" and num_codebooks <= 6:
+            logging.warning_once(f"`delay_strategy=group_first_6` but there are only {num_codebooks} codebooks. Switching the strategy to `delay`.")
+            delay_strategy = "delay"
+        if delay_strategy == "group" and num_codebooks <= 3:
+            raise ValueError(f"`delay_strategy=group` but there are only {num_codebooks} codebooks. Make sure `num_codebooks>4` or to change the strategy to `delay`.")
+        if delay_strategy == "delay_first_8" and num_codebooks <= 8:
+            logging.warning_once(f"`delay_strategy=delay_first_8` but there are only {num_codebooks} codebooks. Switching the strategy to `delay`.")
+            delay_strategy = "delay"
+
+        
+        self.delay_strategy = delay_strategy
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

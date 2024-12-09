@@ -336,7 +336,13 @@ def main():
         trust_remote_code=data_args.trust_remote_code,
         attn_implementation={"decoder": model_args.attn_implementation, "text_encoder": "eager"},
     )
-
+    # TODO: dirty hack, how to fix this ? 
+    # comes from the from_pretrained that loads weight, behaviour that wasn't appearing before
+    # TODO: verify it works with large
+    if not config.decoder.rope_embeddings and model.decoder.model.decoder.embed_positions.weights.requires_grad:
+        model.decoder.model.decoder.embed_positions.weights.requires_grad = False
+        model.decoder.model.decoder.embed_positions.weights.detach_()
+            
     # enable gradient checkpointing if necessary
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -361,6 +367,7 @@ def main():
     num_codebooks = model.decoder.config.num_codebooks
     bandwidth = model_args.bandwidth
     attn_implementation = model_args.attn_implementation
+    delay_strategy = config.decoder.delay_strategy
 
     # Freeze Encoders
     model.freeze_encoders(model_args.freeze_text_encoder)
@@ -467,6 +474,7 @@ def main():
                 pad_token_id=audio_encoder_eos_token_id,
                 max_length=labels.shape[-1] + num_codebooks,
                 num_codebooks=num_codebooks,
+                strategy=delay_strategy,
             )
 
             # the first ids of the delay pattern mask are precisely labels, we use the rest of the labels mask
@@ -1203,7 +1211,6 @@ def main():
                 if cur_step == total_train_steps:
                     continue_training = False
                     break
-
         if not continue_training:
             break
 
